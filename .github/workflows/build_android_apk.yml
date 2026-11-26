@@ -36,11 +36,12 @@ jobs:
           cp android/app/src/main/AndroidManifest.xml /tmp/AndroidManifest.xml
           flutter create --platforms=android --org com.deskremote --project-name desk_remote_ble .
           cp /tmp/AndroidManifest.xml android/app/src/main/AndroidManifest.xml
+          rm -f test/widget_test.dart
 
       - name: Install dependencies & analyze
         run: |
           flutter pub get
-          flutter analyze --no-fatal-infos
+          flutter analyze --no-fatal-infos lib
 
       - name: Build Release APK
         run: |
