@@ -110,6 +110,27 @@ async def state_sync_loop(
             pass
 
 
+async def telemetry_sync_loop(
+    hardware: HardwareManager,
+    server: DeskRemoteGattServer,
+    stop_event: asyncio.Event,
+    interval: float = 1.5,
+) -> None:
+    """Poll Linux hardware telemetry every 1.5s and notify subscribed BLE clients."""
+    while not stop_event.is_set():
+        try:
+            if server.telemetry_char and server.telemetry_char.is_notifying:
+                payload = await asyncio.to_thread(hardware.get_system_telemetry)
+                server.telemetry_char.notify_value(payload)
+        except Exception as exc:
+            logger.debug("Telemetry sync iteration error: %s", exc)
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def run_server(args: argparse.Namespace) -> None:
     hardware = HardwareManager(min_brightness=args.min_brightness)
     server = DeskRemoteGattServer(
@@ -130,7 +151,10 @@ async def run_server(args: argparse.Namespace) -> None:
             "DeskRemote BLE server ready (audio=PipeWire/PulseAudio, brightness=%s)",
             hardware.brightness.backend,
         )
-        await state_sync_loop(hardware, server, args.poll_interval, stop_event)
+        await asyncio.gather(
+            state_sync_loop(hardware, server, args.poll_interval, stop_event),
+            telemetry_sync_loop(hardware, server, stop_event, interval=1.5),
+        )
     finally:
         await server.stop()
         hardware.close()

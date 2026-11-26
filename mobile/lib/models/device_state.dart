@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'system_telemetry.dart';
+
 enum BleConnectionStatus {
   disconnected,
   scanning,
@@ -19,6 +21,7 @@ class DeviceState {
   final String? connectedDeviceName;
   final String? connectedDeviceId;
   final String? errorMessage;
+  final SystemTelemetry telemetry;
 
   const DeviceState({
     this.volume = 50,
@@ -31,6 +34,7 @@ class DeviceState {
     this.connectedDeviceName,
     this.connectedDeviceId,
     this.errorMessage,
+    this.telemetry = const SystemTelemetry(),
   });
 
   bool get isConnected => connectionStatus == BleConnectionStatus.connected;
@@ -54,6 +58,7 @@ class DeviceState {
     String? connectedDeviceName,
     String? connectedDeviceId,
     String? errorMessage,
+    SystemTelemetry? telemetry,
     bool clearError = false,
     bool clearDevice = false,
   }) {
@@ -70,6 +75,8 @@ class DeviceState {
       connectedDeviceId:
           clearDevice ? null : (connectedDeviceId ?? this.connectedDeviceId),
       errorMessage: clearError ? null : (errorMessage ?? this.errorMessage),
+      telemetry:
+          clearDevice ? const SystemTelemetry() : (telemetry ?? this.telemetry),
     );
   }
 

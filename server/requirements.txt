@@ -1,2 +1,3 @@
 dbus-next>=0.2.3
 pulsectl>=24.4.0
+psutil>=5.9.0

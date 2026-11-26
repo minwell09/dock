@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import logging
+import os
+import shlex
 import shutil
+import struct
 import subprocess
 import threading
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
+try:
+    import psutil
+except ImportError:  # pragma: no cover
+    psutil = None
 
 try:
     import pulsectl
@@ -400,13 +409,228 @@ class MediaController:
             return MediaState()
 
 
+class AppLauncher:
+    """Safe, non-blocking Linux desktop application launcher."""
+
+    MAX_COMMAND_BYTES = 128
+
+    def launch(self, command: str) -> bool:
+        """Parse, validate, and spawn a detached desktop application."""
+        raw = command.strip()
+        if not raw:
+            logger.warning("Ignored empty app launch command")
+            return False
+
+        if len(raw.encode("utf-8")) > self.MAX_COMMAND_BYTES:
+            logger.warning("Rejected app launch command exceeding %d bytes", self.MAX_COMMAND_BYTES)
+            return False
+
+        try:
+            parts = shlex.split(raw)
+        except ValueError as exc:
+            logger.warning("Invalid app launch command %r: %s", raw, exc)
+            return False
+
+        if not parts:
+            return False
+
+        executable = shutil.which(parts[0])
+        if not executable:
+            logger.warning("Executable not found on PATH: %r", parts[0])
+            return False
+
+        env = os.environ.copy()
+        env.setdefault("DISPLAY", ":0")
+        if "DBUS_SESSION_BUS_ADDRESS" not in env:
+            uid = os.getuid()
+            default_bus = f"/run/user/{uid}/bus"
+            if os.path.exists(default_bus):
+                env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={default_bus}"
+        # Preserve WAYLAND_DISPLAY if present in current environment
+        if "WAYLAND_DISPLAY" in os.environ:
+            env["WAYLAND_DISPLAY"] = os.environ["WAYLAND_DISPLAY"]
+
+        try:
+            subprocess.Popen(
+                [executable, *parts[1:]],
+                env=env,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info("Launched app: %s", raw)
+            return True
+        except Exception as exc:
+            logger.warning("Failed to launch %r: %s", raw, exc)
+            return False
+
+
+class TelemetryCollector:
+    """Collects compact 12-byte little-endian hardware telemetry (<BBBHHBBHB)."""
+
+    STRUCT_FORMAT = "<BBBHHBBHB"
+    PREFERRED_TEMP_SENSORS = ("coretemp", "k10temp", "zenpower", "acpitz")
+
+    def __init__(self) -> None:
+        self._nvidia_smi = shutil.which("nvidia-smi")
+        if psutil is not None:
+            try:
+                # Prime non-blocking CPU percentage baseline
+                psutil.cpu_percent(interval=None)
+            except Exception:
+                pass
+
+    def _read_cpu_temp(self) -> int:
+        if psutil is None or not hasattr(psutil, "sensors_temperatures"):
+            return 0
+        try:
+            temps = psutil.sensors_temperatures()
+            if not temps:
+                return 0
+
+            for sensor_name in self.PREFERRED_TEMP_SENSORS:
+                entries = temps.get(sensor_name)
+                if entries:
+                    for entry in entries:
+                        if entry.current is not None and entry.current > 0:
+                            return max(0, min(150, int(round(entry.current))))
+
+            for entries in temps.values():
+                for entry in entries:
+                    if entry.current is not None and entry.current > 0:
+                        return max(0, min(150, int(round(entry.current))))
+        except Exception as exc:
+            logger.debug("Unable to read CPU temperature: %s", exc)
+        return 0
+
+    def _read_gpu_stats(self) -> Tuple[int, int, int]:
+        """Return (gpu_usage 0..100 or 255, gpu_temp 0..150, vram_used_mb)."""
+        if self._nvidia_smi:
+            try:
+                out = subprocess.check_output(
+                    [
+                        self._nvidia_smi,
+                        "--query-gpu=utilization.gpu,temperature.gpu,memory.used",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=0.3,
+                ).strip()
+                if out:
+                    first_line = out.splitlines()[0]
+                    parts = [p.strip() for p in first_line.split(",")]
+                    if len(parts) >= 3:
+                        usage = max(0, min(100, int(round(float(parts[0])))))
+                        temp = max(0, min(150, int(round(float(parts[1])))))
+                        vram_mb = max(0, min(65535, int(round(float(parts[2])))))
+                        return usage, temp, vram_mb
+            except Exception as exc:
+                logger.debug("nvidia-smi query failed: %s", exc)
+
+        # Fallback to DRM sysfs (AMD / Intel GPUs exposing gpu_busy_percent)
+        for busy_path in sorted(glob.glob("/sys/class/drm/card*/device/gpu_busy_percent")):
+            try:
+                with open(busy_path, "r", encoding="utf-8") as fh:
+                    usage = max(0, min(100, int(fh.read().strip())))
+
+                device_dir = os.path.dirname(busy_path)
+                temp = 0
+                for temp_path in sorted(glob.glob(os.path.join(device_dir, "hwmon/hwmon*/temp1_input"))):
+                    try:
+                        with open(temp_path, "r", encoding="utf-8") as tfh:
+                            millideg = int(tfh.read().strip())
+                            temp = max(0, min(150, int(round(millideg / 1000.0))))
+                            break
+                    except Exception:
+                        pass
+
+                vram_mb = 0
+                vram_path = os.path.join(device_dir, "mem_info_vram_used")
+                if os.path.exists(vram_path):
+                    try:
+                        with open(vram_path, "r", encoding="utf-8") as vfh:
+                            vram_bytes = int(vfh.read().strip())
+                            vram_mb = max(0, min(65535, int(round(vram_bytes / (1024 * 1024)))))
+                    except Exception:
+                        pass
+
+                return usage, temp, vram_mb
+            except Exception:
+                continue
+
+        return 255, 0, 0
+
+    def _read_battery_byte(self) -> int:
+        if psutil is None or not hasattr(psutil, "sensors_battery"):
+            return 255
+        try:
+            batt = psutil.sensors_battery()
+            if batt is None or batt.percent is None:
+                return 255
+            pct = max(0, min(100, int(round(batt.percent))))
+            if batt.power_plugged:
+                pct |= 0x80
+            return pct
+        except Exception as exc:
+            logger.debug("Unable to read battery status: %s", exc)
+            return 255
+
+    def get_system_telemetry(self) -> bytes:
+        """Pack 12-byte little-endian hardware telemetry struct (<BBBHHBBHB)."""
+        cpu_usage = 0
+        ram_usage = 0
+        ram_used_mb = 0
+        ram_total_mb = 0
+
+        if psutil is not None:
+            try:
+                cpu_usage = max(0, min(100, int(round(psutil.cpu_percent(interval=None)))))
+            except Exception as exc:
+                logger.debug("CPU usage read failed: %s", exc)
+
+            try:
+                vm = psutil.virtual_memory()
+                ram_usage = max(0, min(100, int(round(vm.percent))))
+                ram_used_mb = max(0, min(65535, int(round(vm.used / (1024 * 1024)))))
+                ram_total_mb = max(0, min(65535, int(round(vm.total / (1024 * 1024)))))
+            except Exception as exc:
+                logger.debug("RAM usage read failed: %s", exc)
+
+        cpu_temp = self._read_cpu_temp()
+        gpu_usage, gpu_temp, vram_used_mb = self._read_gpu_stats()
+        battery_byte = self._read_battery_byte()
+
+        return struct.pack(
+            self.STRUCT_FORMAT,
+            cpu_usage,
+            cpu_temp,
+            ram_usage,
+            ram_used_mb,
+            ram_total_mb,
+            gpu_usage,
+            gpu_temp,
+            vram_used_mb,
+            battery_byte,
+        )
+
+
 class HardwareManager:
-    """Unified facade for Linux system audio, brightness, and media."""
+    """Unified facade for Linux audio, brightness, media, app launcher, and telemetry."""
 
     def __init__(self, min_brightness: int = 1) -> None:
         self.audio = AudioController()
         self.brightness = BrightnessController(min_brightness=min_brightness)
         self.media = MediaController()
+        self.launcher = AppLauncher()
+        self.telemetry = TelemetryCollector()
+
+    def launch_app(self, command: str) -> bool:
+        return self.launcher.launch(command)
+
+    def get_system_telemetry(self) -> bytes:
+        return self.telemetry.get_system_telemetry()
 
     def close(self) -> None:
         self.audio.close()

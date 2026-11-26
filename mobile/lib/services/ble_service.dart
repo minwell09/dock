@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -7,6 +8,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/device_state.dart';
+import '../models/system_telemetry.dart';
 
 /// Custom DeskRemote BLE GATT UUIDs (must match server/ble_gatt.py).
 class DeskRemoteUuids {
@@ -15,6 +17,8 @@ class DeskRemoteUuids {
   static final Guid brightnessChar = Guid('7e4a0003-b5a3-f393-e0a9-e50e24dcca9e');
   static final Guid mediaCtrlChar = Guid('7e4a0004-b5a3-f393-e0a9-e50e24dcca9e');
   static final Guid mediaStateChar = Guid('7e4a0005-b5a3-f393-e0a9-e50e24dcca9e');
+  static final Guid appLaunchChar = Guid('7e4a0006-b5a3-f393-e0a9-e50e24dcca9e');
+  static final Guid telemetryChar = Guid('7e4a0007-b5a3-f393-e0a9-e50e24dcca9e');
 }
 
 /// Media control single-byte command codes.
@@ -125,6 +129,8 @@ class BleService extends ChangeNotifier {
   BluetoothCharacteristic? _brightnessChar;
   BluetoothCharacteristic? _mediaCtrlChar;
   BluetoothCharacteristic? _mediaStateChar;
+  BluetoothCharacteristic? _appLaunchChar;
+  BluetoothCharacteristic? _telemetryChar;
 
   StreamSubscription<BluetoothAdapterState>? _adapterSub;
   StreamSubscription<List<ScanResult>>? _scanSub;
@@ -133,6 +139,7 @@ class BleService extends ChangeNotifier {
   StreamSubscription<List<int>>? _volNotifySub;
   StreamSubscription<List<int>>? _brightNotifySub;
   StreamSubscription<List<int>>? _mediaNotifySub;
+  StreamSubscription<List<int>>? _telemetryNotifySub;
 
   Timer? _reconnectTimer;
   int _reconnectAttempt = 0;
@@ -327,6 +334,8 @@ class BleService extends ChangeNotifier {
       _brightnessChar = null;
       _mediaCtrlChar = null;
       _mediaStateChar = null;
+      _appLaunchChar = null;
+      _telemetryChar = null;
 
       for (final c in targetService.characteristics) {
         if (c.uuid == DeskRemoteUuids.volumeChar) {
@@ -337,6 +346,10 @@ class BleService extends ChangeNotifier {
           _mediaCtrlChar = c;
         } else if (c.uuid == DeskRemoteUuids.mediaStateChar) {
           _mediaStateChar = c;
+        } else if (c.uuid == DeskRemoteUuids.appLaunchChar) {
+          _appLaunchChar = c;
+        } else if (c.uuid == DeskRemoteUuids.telemetryChar) {
+          _telemetryChar = c;
         }
       }
 
@@ -407,6 +420,18 @@ class BleService extends ChangeNotifier {
         _updateState(_state.applyMediaJsonBytes(bytes));
       });
     }
+
+    if (_telemetryChar != null) {
+      try {
+        final initial = await _telemetryChar!.read();
+        _applyTelemetryBytes(initial);
+      } catch (_) {}
+
+      await _telemetryChar!.setNotifyValue(true);
+      _telemetryNotifySub = _telemetryChar!.onValueReceived.listen((bytes) {
+        _applyTelemetryBytes(bytes);
+      });
+    }
   }
 
   void _handleUnexpectedDisconnect() {
@@ -450,6 +475,8 @@ class BleService extends ChangeNotifier {
     _brightnessChar = null;
     _mediaCtrlChar = null;
     _mediaStateChar = null;
+    _appLaunchChar = null;
+    _telemetryChar = null;
 
     _updateState(
       _state.copyWith(
@@ -493,6 +520,25 @@ class BleService extends ChangeNotifier {
     }
   }
 
+  Future<void> launchApp(String command) async {
+    final char = _appLaunchChar;
+    final trimmed = command.trim();
+    if (char == null || !_state.isConnected || trimmed.isEmpty) return;
+
+    final payload = utf8.encode(trimmed);
+    if (payload.length > 128) {
+      debugPrint('App launch command exceeds 128-byte limit');
+      return;
+    }
+
+    try {
+      final useNoResp = char.properties.writeWithoutResponse;
+      await char.write(payload, withoutResponse: useNoResp);
+    } catch (e) {
+      debugPrint('App launch write failed: $e');
+    }
+  }
+
   Future<void> _rawWriteVolume(List<int> payload) async {
     final char = _volumeChar;
     if (char == null || !_state.isConnected) return;
@@ -524,13 +570,22 @@ class BleService extends ChangeNotifier {
     _updateState(_state.copyWith(brightness: pct));
   }
 
+  void _applyTelemetryBytes(List<int> bytes) {
+    final parsed = SystemTelemetry.fromBytes(bytes);
+    if (parsed != null) {
+      _updateState(_state.copyWith(telemetry: parsed));
+    }
+  }
+
   Future<void> _cancelCharacteristicSubscriptions() async {
     await _volNotifySub?.cancel();
     await _brightNotifySub?.cancel();
     await _mediaNotifySub?.cancel();
+    await _telemetryNotifySub?.cancel();
     _volNotifySub = null;
     _brightNotifySub = null;
     _mediaNotifySub = null;
+    _telemetryNotifySub = null;
   }
 
   void _updateState(DeviceState next) {

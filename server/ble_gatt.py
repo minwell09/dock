@@ -30,6 +30,8 @@ VOLUME_CHAR_UUID = "7e4a0002-b5a3-f393-e0a9-e50e24dcca9e"
 BRIGHTNESS_CHAR_UUID = "7e4a0003-b5a3-f393-e0a9-e50e24dcca9e"
 MEDIA_CTRL_CHAR_UUID = "7e4a0004-b5a3-f393-e0a9-e50e24dcca9e"
 MEDIA_STATE_CHAR_UUID = "7e4a0005-b5a3-f393-e0a9-e50e24dcca9e"
+APP_LAUNCH_CHAR_UUID = "7e4a0006-b5a3-f393-e0a9-e50e24dcca9e"
+TELEMETRY_CHAR_UUID = "7e4a0007-b5a3-f393-e0a9-e50e24dcca9e"
 
 APP_ROOT_PATH = "/com/deskremote"
 SERVICE_PATH = f"{APP_ROOT_PATH}/service0"
@@ -150,14 +152,14 @@ class GattCharacteristic(ServiceInterface):
         return self._value
 
     @method()
-    def WriteValue(self, value: "ay", options: "a{sv}") -> None:  # noqa: N802
+    def WriteValue(self, value: "ay", options: "a{sv}") -> "":  # noqa: N802
         data = bytes(value)
         self._value = data
         if self._on_write is not None:
             self._on_write(data)
 
     @method()
-    def StartNotify(self) -> None:  # noqa: N802
+    def StartNotify(self) -> "":  # noqa: N802
         if self._notifying:
             return
         self._notifying = True
@@ -167,7 +169,7 @@ class GattCharacteristic(ServiceInterface):
             self.notify_value(self._on_read())
 
     @method()
-    def StopNotify(self) -> None:  # noqa: N802
+    def StopNotify(self) -> "":  # noqa: N802
         if not self._notifying:
             return
         self._notifying = False
@@ -206,7 +208,7 @@ class LEAdvertisement(ServiceInterface):
         return True
 
     @method()
-    def Release(self) -> None:  # noqa: N802
+    def Release(self) -> "":  # noqa: N802
         logger.info("BLE advertisement released by BlueZ")
 
 
@@ -232,6 +234,8 @@ class DeskRemoteGattServer:
         self.brightness_char: Optional[GattCharacteristic] = None
         self.media_ctrl_char: Optional[GattCharacteristic] = None
         self.media_state_char: Optional[GattCharacteristic] = None
+        self.app_launch_char: Optional[GattCharacteristic] = None
+        self.telemetry_char: Optional[GattCharacteristic] = None
 
     async def start(self) -> None:
         """Connect to System D-Bus, export GATT hierarchy, and start BLE advertising."""
@@ -288,12 +292,28 @@ class DeskRemoteGattServer:
             service_path=SERVICE_PATH,
             on_read=self._read_media_state,
         )
+        self.app_launch_char = GattCharacteristic(
+            path=f"{SERVICE_PATH}/char4",
+            uuid=APP_LAUNCH_CHAR_UUID,
+            flags=["write-without-response", "write"],
+            service_path=SERVICE_PATH,
+            on_write=self._write_app_launch,
+        )
+        self.telemetry_char = GattCharacteristic(
+            path=f"{SERVICE_PATH}/char5",
+            uuid=TELEMETRY_CHAR_UUID,
+            flags=["read", "notify"],
+            service_path=SERVICE_PATH,
+            on_read=self._read_telemetry,
+        )
 
         for chrc in (
             self.volume_char,
             self.brightness_char,
             self.media_ctrl_char,
             self.media_state_char,
+            self.app_launch_char,
+            self.telemetry_char,
         ):
             service.add_characteristic(chrc)
             self.bus.export(chrc.path, chrc)
@@ -396,3 +416,20 @@ class DeskRemoteGattServer:
 
     def _read_media_state(self) -> bytes:
         return self.hardware.media.get_state().to_compact_json_bytes()
+
+    def _write_app_launch(self, data: bytes) -> None:
+        if not data:
+            return
+        if len(data) > 128:
+            logger.warning("Ignoring oversized app launch payload (%d bytes)", len(data))
+            return
+        try:
+            command = data.decode("utf-8", errors="ignore").replace("\x00", "").strip()
+        except Exception as exc:
+            logger.warning("Failed to decode app launch payload: %s", exc)
+            return
+        if command:
+            self.hardware.launch_app(command)
+
+    def _read_telemetry(self) -> bytes:
+        return self.hardware.get_system_telemetry()
