@@ -9,6 +9,7 @@ Ultra-low-latency **Stream-Deck style** remote control for a **Linux laptop (Pop
   - **Center Pane**: **Customizable Quick App Launcher** grid — create, edit, and delete app shortcut tiles with custom labels, custom icons picked from your phone's gallery, and target Linux commands (`firefox`, `code`, `steam`, `discord`, `vlc`, etc.). Long-press any tile to edit or delete.
   - **Right Pane**: **Real-Time PC Hardware Telemetry** (animated CPU load & temp, RAM usage/GB, GPU load/temp/VRAM, and Battery/AC status streamed every `1.5s`) paired with a compact **Now Playing + Media Transport** card (`Prev`, `Play/Pause`, `Next`) and BLE connection status.
 - **Bi-Directional Real-Time Sync**: Changes made on the laptop (volume keys, brightness keys, media player) sync back to the phone automatically.
+- **Always-On Screen (Keep Screen Awake)**: Automatically keeps your phone display awake while DeskRemote is active, with a quick sun/moon toggle button in the top-right Telemetry header bar (persisted across launches).
 - **Auto-Reconnect**: Saves your last connected laptop and reconnects automatically with exponential backoff if the BLE link drops.
 
 ## Project Structure
@@ -107,6 +108,25 @@ flutter build apk --release
 # Output: build/app/outputs/flutter-apk/app-release.apk
 ```
 
+### CI APK Signing & Seamless In-Place Updates (GitHub Actions)
+
+The GitHub Actions workflow (`.github/workflows/build-apk.yml`) builds a release APK with an auto-incrementing `--build-number` (`github.run_number`). To install updated APKs directly over an existing installation **without uninstalling or losing your shortcuts/backgrounds**, configure consistent release signing via these 4 optional GitHub Repository Secrets (**Settings → Secrets and variables → Actions**):
+
+| Secret | Description |
+| --- | --- |
+| `KEYSTORE_BASE64` | Base64-encoded contents of your `.jks` keystore file |
+| `KEYSTORE_PASSWORD` | Keystore password (`-storepass`) |
+| `KEY_ALIAS` | Key alias inside the keystore (e.g. `deskremote`) |
+| `KEY_PASSWORD` | Key password (`-keypass`) |
+
+Generate a keystore and encode it in one step:
+
+```bash
+keytool -genkeypair -v -keystore upload-keystore.jks -alias deskremote -keyalg RSA -keysize 2048 -validity 10000 && base64 -w 0 upload-keystore.jks
+```
+
+Copy the base64 output into `KEYSTORE_BASE64` (keep `upload-keystore.jks` backed up safely and never commit it to git). If these secrets are not set, builds gracefully fall back to the debug signing key.
+
 ---
 
 ## 3. Connect & Use
@@ -150,3 +170,5 @@ See [server/README.md](server/README.md) for the complete byte-level telemetry s
   - Verify the executable exists on your `PATH` (e.g., `which firefox`) and check `journalctl --user -u desk-remote-ble.service -f` for launch logs.
 - **GPU stats not shown in Telemetry**:
   - NVIDIA GPUs require `nvidia-smi`; AMD/Intel GPUs fall back to `/sys/class/drm/card*/device/gpu_busy_percent`. If no discrete GPU is detected, the GPU row is automatically hidden.
+- **Android "App not installed / Package conflicts with an existing package" when updating APK**:
+  - This happens when switching between different signing keys (e.g., debug key vs. release keystore). Uninstall the old build once, configure the 4 `KEYSTORE_*` GitHub Secrets above, and all subsequent CI releases will install cleanly in-place while preserving settings, wallpapers, and shortcuts.

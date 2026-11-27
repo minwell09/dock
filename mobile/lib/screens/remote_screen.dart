@@ -5,6 +5,8 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../models/app_shortcut.dart';
 import '../models/device_state.dart';
@@ -24,6 +26,8 @@ class RemoteScreen extends StatefulWidget {
 }
 
 class _RemoteScreenState extends State<RemoteScreen> {
+  static const _keepScreenOnKey = 'keep_screen_on';
+
   final ShortcutStorage _storage = ShortcutStorage();
   final BackgroundStorage _bgStorage = BackgroundStorage();
   final ImagePicker _imagePicker = ImagePicker();
@@ -32,10 +36,12 @@ class _RemoteScreenState extends State<RemoteScreen> {
   bool _loadingShortcuts = true;
   BackgroundSettings _bgSettings = const BackgroundSettings();
   int _bgVersion = 0;
+  bool _keepScreenOn = true;
 
   @override
   void initState() {
     super.initState();
+    WakelockPlus.enable();
     _loadInitialData();
   }
 
@@ -43,13 +49,51 @@ class _RemoteScreenState extends State<RemoteScreen> {
     final results = await Future.wait([
       _storage.loadShortcuts(),
       _bgStorage.loadSettings(),
+      SharedPreferences.getInstance(),
     ]);
+    final prefs = results[2] as SharedPreferences;
+    final savedKeepScreenOn = prefs.getBool(_keepScreenOnKey) ?? true;
+    await _applyWakelock(savedKeepScreenOn);
+
     if (!mounted) return;
     setState(() {
       _shortcuts = results[0] as List<AppShortcut>;
       _bgSettings = results[1] as BackgroundSettings;
+      _keepScreenOn = savedKeepScreenOn;
       _loadingShortcuts = false;
     });
+  }
+
+  Future<void> _applyWakelock(bool enabled) async {
+    if (enabled) {
+      await WakelockPlus.enable();
+    } else {
+      await WakelockPlus.disable();
+    }
+  }
+
+  Future<void> _toggleKeepScreenOn() async {
+    HapticFeedback.lightImpact();
+    final nextValue = !_keepScreenOn;
+    setState(() => _keepScreenOn = nextValue);
+
+    await _applyWakelock(nextValue);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keepScreenOnKey, nextValue);
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(
+            nextValue ? 'Keep screen on: Enabled' : 'Keep screen on: Disabled',
+          ),
+          duration: const Duration(milliseconds: 1200),
+          behavior: SnackBarBehavior.floating,
+          width: 240,
+        ),
+      );
   }
 
   Future<void> _launchShortcut(AppShortcut shortcut) async {
@@ -721,6 +765,8 @@ class _RemoteScreenState extends State<RemoteScreen> {
                               child: _TelemetryCard(
                                 telemetry: state.telemetry,
                                 hasCustomBackground: hasCustomBg,
+                                keepScreenOn: _keepScreenOn,
+                                onToggleKeepScreenOn: _toggleKeepScreenOn,
                                 onOpenBackgroundSettings:
                                     _showBackgroundSettingsDialog,
                               ),
@@ -1188,15 +1234,19 @@ class _AddShortcutTile extends StatelessWidget {
   }
 }
 
-/// Top-Right Pane: Glassmorphic Real-Time PC Hardware Telemetry Card + Wallpaper Trigger.
+/// Top-Right Pane: Glassmorphic Real-Time PC Hardware Telemetry Card + Quick Controls.
 class _TelemetryCard extends StatelessWidget {
   final SystemTelemetry telemetry;
   final bool hasCustomBackground;
+  final bool keepScreenOn;
+  final VoidCallback onToggleKeepScreenOn;
   final VoidCallback onOpenBackgroundSettings;
 
   const _TelemetryCard({
     required this.telemetry,
     required this.hasCustomBackground,
+    required this.keepScreenOn,
+    required this.onToggleKeepScreenOn,
     required this.onOpenBackgroundSettings,
   });
 
@@ -1252,6 +1302,27 @@ class _TelemetryCard extends StatelessWidget {
                     ),
                   ),
                 ),
+              SizedBox(
+                width: 28,
+                height: 28,
+                child: IconButton(
+                  padding: EdgeInsets.zero,
+                  iconSize: 17,
+                  tooltip: keepScreenOn
+                      ? 'Keep Screen On (Enabled)'
+                      : 'Keep Screen On (Disabled)',
+                  onPressed: onToggleKeepScreenOn,
+                  icon: Icon(
+                    keepScreenOn
+                        ? Icons.light_mode_rounded
+                        : Icons.bedtime_outlined,
+                    color: keepScreenOn
+                        ? Colors.amberAccent.shade200
+                        : Colors.white.withValues(alpha: 0.60),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 2),
               SizedBox(
                 width: 28,
                 height: 28,
