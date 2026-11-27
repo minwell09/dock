@@ -166,7 +166,7 @@ class _ScanScreenState extends State<ScanScreen> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.errorContainer.withOpacity(0.55),
+        color: Theme.of(context).colorScheme.errorContainer.withValues(alpha: 0.55),
         borderRadius: BorderRadius.circular(12),
       ),
       child: Row(
@@ -191,17 +191,17 @@ class _ScanScreenState extends State<ScanScreen> {
   Widget _buildQuickReconnectCard(BleService ble, bool isBusy) {
     return Card(
       elevation: 0,
-      color: Theme.of(context).colorScheme.primaryContainer.withOpacity(0.35),
+      color: Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.35),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(16),
         side: BorderSide(
-          color: Theme.of(context).colorScheme.primary.withOpacity(0.35),
+          color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.35),
         ),
       ),
       child: ListTile(
         contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
         leading: CircleAvatar(
-          backgroundColor: Theme.of(context).colorScheme.primary.withOpacity(0.2),
+          backgroundColor: Theme.of(context).colorScheme.primary.withValues(alpha: 0.2),
           child: Icon(
             Icons.laptop_rounded,
             color: Theme.of(context).colorScheme.primary,
@@ -246,7 +246,7 @@ class _ScanScreenState extends State<ScanScreen> {
             Icon(
               Icons.radar_rounded,
               size: 64,
-              color: Theme.of(context).colorScheme.onSurfaceVariant.withOpacity(0.4),
+              color: Theme.of(context).colorScheme.onSurfaceVariant.withValues(alpha: 0.4),
             ),
             const SizedBox(height: 16),
             Text(
@@ -284,7 +284,7 @@ class _ScanScreenState extends State<ScanScreen> {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
             side: BorderSide(
-              color: Theme.of(context).colorScheme.outlineVariant.withOpacity(0.5),
+              color: Theme.of(context).colorScheme.outlineVariant.withValues(alpha: 0.5),
             ),
           ),
           child: ListTile(

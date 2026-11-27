@@ -1,4 +1,6 @@
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,8 +9,10 @@ import 'package:image_picker/image_picker.dart';
 import '../models/app_shortcut.dart';
 import '../models/device_state.dart';
 import '../models/system_telemetry.dart';
+import '../services/background_storage.dart';
 import '../services/ble_service.dart';
 import '../services/shortcut_storage.dart';
+import '../widgets/audio_light_visualizer.dart';
 
 class RemoteScreen extends StatefulWidget {
   final BleService bleService;
@@ -21,22 +25,29 @@ class RemoteScreen extends StatefulWidget {
 
 class _RemoteScreenState extends State<RemoteScreen> {
   final ShortcutStorage _storage = ShortcutStorage();
+  final BackgroundStorage _bgStorage = BackgroundStorage();
   final ImagePicker _imagePicker = ImagePicker();
 
   List<AppShortcut> _shortcuts = [];
   bool _loadingShortcuts = true;
+  BackgroundSettings _bgSettings = const BackgroundSettings();
+  int _bgVersion = 0;
 
   @override
   void initState() {
     super.initState();
-    _loadShortcuts();
+    _loadInitialData();
   }
 
-  Future<void> _loadShortcuts() async {
-    final loaded = await _storage.loadShortcuts();
+  Future<void> _loadInitialData() async {
+    final results = await Future.wait([
+      _storage.loadShortcuts(),
+      _bgStorage.loadSettings(),
+    ]);
     if (!mounted) return;
     setState(() {
-      _shortcuts = loaded;
+      _shortcuts = results[0] as List<AppShortcut>;
+      _bgSettings = results[1] as BackgroundSettings;
       _loadingShortcuts = false;
     });
   }
@@ -55,6 +66,249 @@ class _RemoteScreenState extends State<RemoteScreen> {
           width: 260,
         ),
       );
+  }
+
+  Future<void> _showBackgroundSettingsDialog() async {
+    HapticFeedback.lightImpact();
+
+    await showDialog<void>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: 0.35),
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            final colorScheme = Theme.of(context).colorScheme;
+            final hasCustomBg = _bgSettings.hasCustomBackground;
+            final dimPct = (_bgSettings.dimOpacity * 100).round();
+            final blurVal = _bgSettings.blurSigma;
+
+            return AlertDialog(
+              backgroundColor: const Color(0xE8101521),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(22),
+                side: BorderSide(
+                  color: Colors.white.withValues(alpha: 0.16),
+                ),
+              ),
+              title: Row(
+                children: [
+                  Icon(
+                    Icons.wallpaper_rounded,
+                    size: 20,
+                    color: colorScheme.primary,
+                  ),
+                  const SizedBox(width: 8),
+                  const Text(
+                    'Dashboard Background',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                  ),
+                ],
+              ),
+              contentPadding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
+              content: SizedBox(
+                width: 420,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // Pick Image / GIF & Preview Row
+                      Row(
+                        children: [
+                          Container(
+                            width: 72,
+                            height: 44,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: Colors.white.withValues(alpha: 0.18),
+                              ),
+                              gradient: const LinearGradient(
+                                colors: [Color(0xFF141B2D), Color(0xFF1E293B)],
+                              ),
+                            ),
+                            clipBehavior: Clip.antiAlias,
+                            child: hasCustomBg
+                                ? Image.file(
+                                    File(_bgSettings.filePath!),
+                                    key: ValueKey(
+                                      'preview_${_bgSettings.filePath}_$_bgVersion',
+                                    ),
+                                    fit: BoxFit.cover,
+                                    gaplessPlayback: true,
+                                  )
+                                : Icon(
+                                    Icons.auto_awesome_rounded,
+                                    size: 20,
+                                    color: colorScheme.primary,
+                                  ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: FilledButton.tonalIcon(
+                              onPressed: () async {
+                                // Do NOT pass maxWidth/maxHeight so Android preserves
+                                // animated .gif frames without flattening them.
+                                final picked = await _imagePicker.pickImage(
+                                  source: ImageSource.gallery,
+                                );
+                                if (picked == null) return;
+                                final persistedPath = await _bgStorage
+                                    .persistBackgroundFile(picked.path);
+                                final updated = _bgSettings.copyWith(
+                                  filePath: persistedPath,
+                                );
+                                await _bgStorage.saveSettings(updated);
+                                if (!mounted) return;
+                                setState(() {
+                                  _bgSettings = updated;
+                                  _bgVersion++;
+                                });
+                                setDialogState(() {});
+                              },
+                              icon: const Icon(
+                                Icons.photo_library_rounded,
+                                size: 18,
+                              ),
+                              label: const Text('Pick Image / GIF'),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 14),
+
+                      // Dim Overlay Slider
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.brightness_4_rounded,
+                            size: 16,
+                            color: Colors.white70,
+                          ),
+                          const SizedBox(width: 6),
+                          const Text(
+                            'Dim Overlay',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const Spacer(),
+                          Text(
+                            '$dimPct%',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: colorScheme.primary,
+                            ),
+                          ),
+                        ],
+                      ),
+                      SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 4,
+                          thumbShape: const RoundSliderThumbShape(
+                            enabledThumbRadius: 7,
+                          ),
+                        ),
+                        child: Slider(
+                          value: _bgSettings.dimOpacity,
+                          min: 0.0,
+                          max: 0.85,
+                          onChanged: (v) {
+                            final updated =
+                                _bgSettings.copyWith(dimOpacity: v);
+                            setState(() => _bgSettings = updated);
+                            setDialogState(() {});
+                          },
+                          onChangeEnd: (v) {
+                            _bgStorage.saveSettings(
+                              _bgSettings.copyWith(dimOpacity: v),
+                            );
+                          },
+                        ),
+                      ),
+
+                      // Blur Sigma Slider
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.blur_on_rounded,
+                            size: 16,
+                            color: Colors.white70,
+                          ),
+                          const SizedBox(width: 6),
+                          const Text(
+                            'Background Blur',
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          const Spacer(),
+                          Text(
+                            blurVal.toStringAsFixed(1),
+                            style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: colorScheme.primary,
+                            ),
+                          ),
+                        ],
+                      ),
+                      SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 4,
+                          thumbShape: const RoundSliderThumbShape(
+                            enabledThumbRadius: 7,
+                          ),
+                        ),
+                        child: Slider(
+                          value: _bgSettings.blurSigma,
+                          min: 0.0,
+                          max: 15.0,
+                          onChanged: (v) {
+                            final updated = _bgSettings.copyWith(blurSigma: v);
+                            setState(() => _bgSettings = updated);
+                            setDialogState(() {});
+                          },
+                          onChangeEnd: (v) {
+                            _bgStorage.saveSettings(
+                              _bgSettings.copyWith(blurSigma: v),
+                            );
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton.icon(
+                  onPressed: () async {
+                    final defaults = await _bgStorage.resetToDefault();
+                    if (!mounted) return;
+                    setState(() {
+                      _bgSettings = defaults;
+                      _bgVersion++;
+                    });
+                    setDialogState(() {});
+                  },
+                  icon: const Icon(Icons.refresh_rounded, size: 17),
+                  label: const Text('Reset Default'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Done'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    await _bgStorage.saveSettings(_bgSettings);
   }
 
   Future<void> _showShortcutDialog({AppShortcut? existing}) async {
@@ -85,6 +339,13 @@ class _RemoteScreenState extends State<RemoteScreen> {
                 File(tempIconPath!).existsSync();
 
             return AlertDialog(
+              backgroundColor: const Color(0xEE101521),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(22),
+                side: BorderSide(
+                  color: Colors.white.withValues(alpha: 0.16),
+                ),
+              ),
               title: Text(isEditing ? 'Edit Shortcut' : 'Add Shortcut'),
               contentPadding: const EdgeInsets.fromLTRB(20, 12, 20, 8),
               content: SizedBox(
@@ -318,130 +579,316 @@ class _RemoteScreenState extends State<RemoteScreen> {
       builder: (context, _) {
         final state = widget.bleService.state;
         final colorScheme = Theme.of(context).colorScheme;
+        final hasCustomBg = _bgSettings.hasCustomBackground;
 
         return Scaffold(
-          body: SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.all(10),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // LEFT PANE (~23%): Dual Tactile Vertical Sliders (Volume & Brightness)
-                  Expanded(
-                    flex: 23,
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: _VerticalControlSlider(
-                            label: 'VOL',
-                            value: state.volume,
-                            min: 0,
-                            max: 100,
-                            isDimmed: state.isMuted,
-                            accentColor: colorScheme.primary,
-                            icon: state.isMuted || state.volume == 0
-                                ? Icons.volume_off_rounded
-                                : state.volume < 50
-                                    ? Icons.volume_down_rounded
-                                    : Icons.volume_up_rounded,
-                            onChanged: (v) => widget.bleService.setVolume(v),
-                            onChangeEnd: (v) => widget.bleService
-                                .setVolume(v, finalCommit: true),
-                            onIconTap: () {
-                              HapticFeedback.mediumImpact();
-                              widget.bleService.toggleMute();
-                            },
-                            badgeText:
-                                state.isMuted ? 'MUTE' : '${state.volume}%',
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: _VerticalControlSlider(
-                            label: 'BRI',
-                            value: state.brightness,
-                            min: 1,
-                            max: 100,
-                            isDimmed: false,
-                            accentColor: Colors.amberAccent.shade200,
-                            icon: state.brightness < 35
-                                ? Icons.brightness_low_rounded
-                                : state.brightness < 75
-                                    ? Icons.brightness_medium_rounded
-                                    : Icons.brightness_high_rounded,
-                            onChanged: (v) =>
-                                widget.bleService.setBrightness(v),
-                            onChangeEnd: (v) => widget.bleService
-                                .setBrightness(v, finalCommit: true),
-                            badgeText: '${state.brightness}%',
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 10),
+          backgroundColor: const Color(0xFF070A12),
+          body: Stack(
+            fit: StackFit.expand,
+            children: [
+              // LAYER 1 (Bottom): Custom Image / Animated GIF OR Default Animated Mesh
+              if (hasCustomBg)
+                Image.file(
+                  File(_bgSettings.filePath!),
+                  key: ValueKey('${_bgSettings.filePath}_$_bgVersion'),
+                  fit: BoxFit.cover,
+                  width: double.infinity,
+                  height: double.infinity,
+                  gaplessPlayback: true,
+                )
+              else
+                const _AnimatedGradientMeshBackground(),
 
-                  // CENTER PANE (~47%): Quick App Launcher Stream-Deck Grid
-                  Expanded(
-                    flex: 47,
-                    child: _AppLauncherDeck(
-                      shortcuts: _shortcuts,
-                      isLoading: _loadingShortcuts,
-                      isConnected: state.isConnected,
-                      onLaunch: _launchShortcut,
-                      onAdd: () => _showShortcutDialog(),
-                      onEdit: (shortcut) {
-                        HapticFeedback.heavyImpact();
-                        _showShortcutDialog(existing: shortcut);
-                      },
+              // LAYER 2 (Readability Overlay): Configurable Blur + Dark Tint
+              if (_bgSettings.blurSigma > 0.05)
+                ClipRect(
+                  child: BackdropFilter(
+                    filter: ImageFilter.blur(
+                      sigmaX: _bgSettings.blurSigma,
+                      sigmaY: _bgSettings.blurSigma,
+                    ),
+                    child: ColoredBox(
+                      color: Colors.black
+                          .withValues(alpha: _bgSettings.dimOpacity),
                     ),
                   ),
-                  const SizedBox(width: 10),
+                )
+              else
+                ColoredBox(
+                  color: Colors.black.withValues(alpha: _bgSettings.dimOpacity),
+                ),
 
-                  // RIGHT PANE (~30%): Telemetry Card (Top) + Media & Connection (Bottom)
-                  Expanded(
-                    flex: 30,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        Expanded(
-                          flex: 56,
-                          child: _TelemetryCard(telemetry: state.telemetry),
+              // LAYER 3 (Glassmorphic 3-Pane Stream-Deck UI)
+              SafeArea(
+                child: Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // LEFT PANE (~23%): Dual Tactile Vertical Sliders (Volume & Brightness)
+                      Expanded(
+                        flex: 23,
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: _VerticalControlSlider(
+                                label: 'VOL',
+                                value: state.volume,
+                                min: 0,
+                                max: 100,
+                                isDimmed: state.isMuted,
+                                accentColor: colorScheme.primary,
+                                icon: state.isMuted || state.volume == 0
+                                    ? Icons.volume_off_rounded
+                                    : state.volume < 50
+                                        ? Icons.volume_down_rounded
+                                        : Icons.volume_up_rounded,
+                                onChanged: (v) =>
+                                    widget.bleService.setVolume(v),
+                                onChangeEnd: (v) => widget.bleService
+                                    .setVolume(v, finalCommit: true),
+                                onIconTap: () {
+                                  HapticFeedback.mediumImpact();
+                                  widget.bleService.toggleMute();
+                                },
+                                badgeText:
+                                    state.isMuted ? 'MUTE' : '${state.volume}%',
+                                reactiveGlow: state.isPlaying && !state.isMuted,
+                                backgroundVisualizer: AudioLightVisualizer(
+                                  isPlaying: state.isPlaying,
+                                  volume: state.volume,
+                                  isMuted: state.isMuted,
+                                  barCount: 8,
+                                  height: 90,
+                                  segmented: false,
+                                  opacity: state.isPlaying && !state.isMuted
+                                      ? 0.34
+                                      : 0.12,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: _VerticalControlSlider(
+                                label: 'BRI',
+                                value: state.brightness,
+                                min: 1,
+                                max: 100,
+                                isDimmed: false,
+                                accentColor: Colors.amberAccent.shade200,
+                                icon: state.brightness < 35
+                                    ? Icons.brightness_low_rounded
+                                    : state.brightness < 75
+                                        ? Icons.brightness_medium_rounded
+                                        : Icons.brightness_high_rounded,
+                                onChanged: (v) =>
+                                    widget.bleService.setBrightness(v),
+                                onChangeEnd: (v) => widget.bleService
+                                    .setBrightness(v, finalCommit: true),
+                                badgeText: '${state.brightness}%',
+                              ),
+                            ),
+                          ],
                         ),
-                        const SizedBox(height: 8),
-                        Expanded(
-                          flex: 44,
-                          child: _CompactMediaAndStatusCard(
-                            state: state,
-                            onDisconnect: widget.bleService.disconnect,
-                            onPrevious: () {
-                              HapticFeedback.lightImpact();
-                              widget.bleService
-                                  .sendMediaCommand(MediaCommand.previous);
-                            },
-                            onPlayPause: () {
-                              HapticFeedback.mediumImpact();
-                              widget.bleService
-                                  .sendMediaCommand(MediaCommand.playPause);
-                            },
-                            onNext: () {
-                              HapticFeedback.lightImpact();
-                              widget.bleService
-                                  .sendMediaCommand(MediaCommand.next);
-                            },
-                          ),
+                      ),
+                      const SizedBox(width: 10),
+
+                      // CENTER PANE (~47%): Quick App Launcher Stream-Deck Grid
+                      Expanded(
+                        flex: 47,
+                        child: _AppLauncherDeck(
+                          shortcuts: _shortcuts,
+                          isLoading: _loadingShortcuts,
+                          isConnected: state.isConnected,
+                          onLaunch: _launchShortcut,
+                          onAdd: () => _showShortcutDialog(),
+                          onEdit: (shortcut) {
+                            HapticFeedback.heavyImpact();
+                            _showShortcutDialog(existing: shortcut);
+                          },
                         ),
-                      ],
-                    ),
+                      ),
+                      const SizedBox(width: 10),
+
+                      // RIGHT PANE (~30%): Telemetry Card (Top) + Media & Visualizer (Bottom)
+                      Expanded(
+                        flex: 30,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Expanded(
+                              flex: 50,
+                              child: _TelemetryCard(
+                                telemetry: state.telemetry,
+                                hasCustomBackground: hasCustomBg,
+                                onOpenBackgroundSettings:
+                                    _showBackgroundSettingsDialog,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Expanded(
+                              flex: 50,
+                              child: _CompactMediaAndStatusCard(
+                                state: state,
+                                onDisconnect: widget.bleService.disconnect,
+                                onPrevious: () {
+                                  HapticFeedback.lightImpact();
+                                  widget.bleService
+                                      .sendMediaCommand(MediaCommand.previous);
+                                },
+                                onPlayPause: () {
+                                  HapticFeedback.mediumImpact();
+                                  widget.bleService
+                                      .sendMediaCommand(MediaCommand.playPause);
+                                },
+                                onNext: () {
+                                  HapticFeedback.lightImpact();
+                                  widget.bleService
+                                      .sendMediaCommand(MediaCommand.next);
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                   ),
-                ],
+                ),
               ),
-            ),
+            ],
           ),
         );
       },
     );
   }
+}
+
+/// Sleek animated dark gradient mesh used when no custom wallpaper/GIF is selected.
+class _AnimatedGradientMeshBackground extends StatefulWidget {
+  const _AnimatedGradientMeshBackground();
+
+  @override
+  State<_AnimatedGradientMeshBackground> createState() =>
+      _AnimatedGradientMeshBackgroundState();
+}
+
+class _AnimatedGradientMeshBackgroundState
+    extends State<_AnimatedGradientMeshBackground>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 18),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return RepaintBoundary(
+      child: AnimatedBuilder(
+        animation: _controller,
+        builder: (context, _) {
+          final t = _controller.value * math.pi * 2.0;
+          return CustomPaint(
+            painter: _GradientMeshPainter(phase: t),
+            size: Size.infinite,
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _GradientMeshPainter extends CustomPainter {
+  final double phase;
+
+  const _GradientMeshPainter({required this.phase});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Offset.zero & size;
+
+    // Deep midnight base
+    final basePaint = Paint()
+      ..shader = const LinearGradient(
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+        colors: [
+          Color(0xFF070B14),
+          Color(0xFF0E1528),
+          Color(0xFF0A0E1B),
+        ],
+      ).createShader(rect);
+    canvas.drawRect(rect, basePaint);
+
+    // Subtle drifting aurora mesh blobs
+    _drawOrb(
+      canvas,
+      Offset(
+        size.width * (0.22 + 0.08 * math.sin(phase)),
+        size.height * (0.28 + 0.10 * math.cos(phase * 0.8)),
+      ),
+      size.shortestSide * 0.72,
+      const Color(0xFF2563EB).withValues(alpha: 0.24),
+    );
+    _drawOrb(
+      canvas,
+      Offset(
+        size.width * (0.78 + 0.07 * math.cos(phase * 0.9)),
+        size.height * (0.72 + 0.09 * math.sin(phase * 0.7)),
+      ),
+      size.shortestSide * 0.75,
+      const Color(0xFF7C3AED).withValues(alpha: 0.22),
+    );
+    _drawOrb(
+      canvas,
+      Offset(
+        size.width * (0.55 + 0.10 * math.sin(phase + 2.1)),
+        size.height * (0.18 + 0.08 * math.cos(phase + 1.2)),
+      ),
+      size.shortestSide * 0.58,
+      const Color(0xFF06B6D4).withValues(alpha: 0.16),
+    );
+  }
+
+  void _drawOrb(Canvas canvas, Offset center, double radius, Color color) {
+    final paint = Paint()
+      ..shader = RadialGradient(
+        colors: [color, color.withValues(alpha: 0.0)],
+      ).createShader(Rect.fromCircle(center: center, radius: radius));
+    canvas.drawCircle(center, radius, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _GradientMeshPainter oldDelegate) =>
+      oldDelegate.phase != phase;
+}
+
+BoxDecoration _glassCardDecoration({
+  double radius = 20,
+  Color? borderColor,
+  double fillAlpha = 0.42,
+  List<BoxShadow>? boxShadow,
+}) {
+  return BoxDecoration(
+    color: Colors.black.withValues(alpha: fillAlpha),
+    borderRadius: BorderRadius.circular(radius),
+    border: Border.all(
+      color: borderColor ?? Colors.white.withValues(alpha: 0.14),
+      width: 1.0,
+    ),
+    boxShadow: boxShadow,
+  );
 }
 
 IconData _fallbackIconForCommand(String command) {
@@ -451,7 +898,9 @@ IconData _fallbackIconForCommand(String command) {
       lower.contains('brave')) {
     return Icons.public_rounded;
   }
-  if (lower.contains('code') || lower.contains('idea') || lower.contains('vim')) {
+  if (lower.contains('code') ||
+      lower.contains('idea') ||
+      lower.contains('vim')) {
     return Icons.code_rounded;
   }
   if (lower.contains('terminal') ||
@@ -472,13 +921,15 @@ IconData _fallbackIconForCommand(String command) {
   if (lower.contains('discord') || lower.contains('slack')) {
     return Icons.headset_mic_rounded;
   }
-  if (lower.contains('vlc') || lower.contains('mpv') || lower.contains('spotify')) {
+  if (lower.contains('vlc') ||
+      lower.contains('mpv') ||
+      lower.contains('spotify')) {
     return Icons.play_circle_filled_rounded;
   }
   return Icons.rocket_launch_rounded;
 }
 
-/// Center Pane: Stream-Deck style Quick App Launcher Grid.
+/// Center Pane: Glassmorphic Stream-Deck style Quick App Launcher Grid.
 class _AppLauncherDeck extends StatelessWidget {
   final List<AppShortcut> shortcuts;
   final bool isLoading;
@@ -502,13 +953,7 @@ class _AppLauncherDeck extends StatelessWidget {
 
     return Container(
       padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: colorScheme.surfaceContainerLow,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(
-          color: colorScheme.outlineVariant.withOpacity(0.35),
-        ),
-      ),
+      decoration: _glassCardDecoration(),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -526,7 +971,7 @@ class _AppLauncherDeck extends StatelessWidget {
                   fontSize: 11,
                   fontWeight: FontWeight.w700,
                   letterSpacing: 1.2,
-                  color: colorScheme.onSurfaceVariant,
+                  color: Colors.white.withValues(alpha: 0.78),
                 ),
               ),
               const Spacer(),
@@ -534,7 +979,7 @@ class _AppLauncherDeck extends StatelessWidget {
                 'Hold tile to edit',
                 style: TextStyle(
                   fontSize: 10,
-                  color: colorScheme.onSurfaceVariant.withOpacity(0.65),
+                  color: Colors.white.withValues(alpha: 0.50),
                 ),
               ),
             ],
@@ -598,7 +1043,7 @@ class _ShortcutTile extends StatelessWidget {
         File(shortcut.iconImagePath!).existsSync();
 
     return Material(
-      color: colorScheme.surfaceContainerHigh,
+      color: Colors.white.withValues(alpha: 0.08),
       borderRadius: BorderRadius.circular(16),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
@@ -608,7 +1053,7 @@ class _ShortcutTile extends StatelessWidget {
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(16),
             border: Border.all(
-              color: colorScheme.outlineVariant.withOpacity(0.35),
+              color: Colors.white.withValues(alpha: 0.14),
             ),
           ),
           child: hasImage
@@ -662,7 +1107,7 @@ class _ShortcutTile extends StatelessWidget {
                       Container(
                         padding: const EdgeInsets.all(10),
                         decoration: BoxDecoration(
-                          color: colorScheme.primary.withOpacity(0.14),
+                          color: colorScheme.primary.withValues(alpha: 0.18),
                           borderRadius: BorderRadius.circular(12),
                         ),
                         child: Icon(
@@ -683,8 +1128,8 @@ class _ShortcutTile extends StatelessWidget {
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
                           color: enabled
-                              ? colorScheme.onSurface
-                              : colorScheme.onSurfaceVariant,
+                              ? Colors.white.withValues(alpha: 0.92)
+                              : Colors.white.withValues(alpha: 0.50),
                         ),
                       ),
                     ],
@@ -705,7 +1150,7 @@ class _AddShortcutTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     return Material(
-      color: colorScheme.surfaceContainerHighest.withOpacity(0.35),
+      color: Colors.white.withValues(alpha: 0.05),
       borderRadius: BorderRadius.circular(16),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
@@ -714,7 +1159,7 @@ class _AddShortcutTile extends StatelessWidget {
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(16),
             border: Border.all(
-              color: colorScheme.primary.withOpacity(0.4),
+              color: colorScheme.primary.withValues(alpha: 0.42),
               width: 1.2,
             ),
           ),
@@ -743,11 +1188,17 @@ class _AddShortcutTile extends StatelessWidget {
   }
 }
 
-/// Top-Right Pane: Real-Time PC Hardware Telemetry Card with animated bars.
+/// Top-Right Pane: Glassmorphic Real-Time PC Hardware Telemetry Card + Wallpaper Trigger.
 class _TelemetryCard extends StatelessWidget {
   final SystemTelemetry telemetry;
+  final bool hasCustomBackground;
+  final VoidCallback onOpenBackgroundSettings;
 
-  const _TelemetryCard({required this.telemetry});
+  const _TelemetryCard({
+    required this.telemetry,
+    required this.hasCustomBackground,
+    required this.onOpenBackgroundSettings,
+  });
 
   Color _tempColor(int tempC) {
     if (tempC >= 80) return const Color(0xFFFF5A5F);
@@ -767,14 +1218,8 @@ class _TelemetryCard extends StatelessWidget {
     final colorScheme = Theme.of(context).colorScheme;
 
     return Container(
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
-      decoration: BoxDecoration(
-        color: colorScheme.surfaceContainerHigh,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(
-          color: colorScheme.outlineVariant.withOpacity(0.35),
-        ),
-      ),
+      padding: const EdgeInsets.fromLTRB(12, 8, 10, 10),
+      decoration: _glassCardDecoration(),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -792,21 +1237,40 @@ class _TelemetryCard extends StatelessWidget {
                   fontSize: 11,
                   fontWeight: FontWeight.w700,
                   letterSpacing: 1.2,
-                  color: colorScheme.onSurfaceVariant,
+                  color: Colors.white.withValues(alpha: 0.78),
                 ),
               ),
               const Spacer(),
               if (!telemetry.hasData)
-                Text(
-                  'Waiting...',
-                  style: TextStyle(
-                    fontSize: 10,
-                    color: colorScheme.onSurfaceVariant,
+                Padding(
+                  padding: const EdgeInsets.only(right: 6),
+                  child: Text(
+                    'Waiting...',
+                    style: TextStyle(
+                      fontSize: 10,
+                      color: Colors.white.withValues(alpha: 0.55),
+                    ),
                   ),
                 ),
+              SizedBox(
+                width: 28,
+                height: 28,
+                child: IconButton(
+                  padding: EdgeInsets.zero,
+                  iconSize: 17,
+                  tooltip: 'Background / GIF Settings',
+                  onPressed: onOpenBackgroundSettings,
+                  icon: Icon(
+                    Icons.wallpaper_rounded,
+                    color: hasCustomBackground
+                        ? colorScheme.primary
+                        : Colors.white.withValues(alpha: 0.78),
+                  ),
+                ),
+              ),
             ],
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 6),
           Expanded(
             child: SingleChildScrollView(
               physics: const BouncingScrollPhysics(),
@@ -824,7 +1288,7 @@ class _TelemetryCard extends StatelessWidget {
                         : null,
                     barColor: const Color(0xFF4F8CFF),
                   ),
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 7),
                   _AnimatedMetricRow(
                     label: 'RAM',
                     fraction: telemetry.ramUsage / 100.0,
@@ -832,11 +1296,11 @@ class _TelemetryCard extends StatelessWidget {
                     trailingBadge: telemetry.ramTotalGb > 0
                         ? '${telemetry.ramUsedGb.toStringAsFixed(1)}/${telemetry.ramTotalGb.toStringAsFixed(0)}G'
                         : null,
-                    trailingColor: colorScheme.onSurfaceVariant,
+                    trailingColor: Colors.white.withValues(alpha: 0.72),
                     barColor: const Color(0xFFA78BFA),
                   ),
                   if (telemetry.hasGpu) ...[
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 7),
                     _AnimatedMetricRow(
                       label: 'GPU',
                       fraction: telemetry.gpuUsage / 100.0,
@@ -844,12 +1308,12 @@ class _TelemetryCard extends StatelessWidget {
                       trailingBadge: _formatGpuDetail(telemetry),
                       trailingColor: telemetry.gpuTemp > 0
                           ? _tempColor(telemetry.gpuTemp)
-                          : colorScheme.onSurfaceVariant,
+                          : Colors.white.withValues(alpha: 0.72),
                       barColor: const Color(0xFF34D399),
                     ),
                   ],
                   if (telemetry.hasBattery) ...[
-                    const SizedBox(height: 8),
+                    const SizedBox(height: 7),
                     _AnimatedMetricRow(
                       label: 'BAT',
                       fraction: (telemetry.batteryPercent ?? 0) / 100.0,
@@ -905,7 +1369,6 @@ class _AnimatedMetricRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
     final clamped = fraction.clamp(0.0, 1.0);
 
     return Column(
@@ -920,7 +1383,7 @@ class _AnimatedMetricRow extends StatelessWidget {
                 style: TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w700,
-                  color: colorScheme.onSurfaceVariant,
+                  color: Colors.white.withValues(alpha: 0.68),
                 ),
               ),
             ),
@@ -929,6 +1392,7 @@ class _AnimatedMetricRow extends StatelessWidget {
               style: const TextStyle(
                 fontSize: 12,
                 fontWeight: FontWeight.w700,
+                color: Colors.white,
               ),
             ),
             const Spacer(),
@@ -936,7 +1400,7 @@ class _AnimatedMetricRow extends StatelessWidget {
               Icon(
                 trailingIcon,
                 size: 13,
-                color: trailingColor ?? colorScheme.onSurfaceVariant,
+                color: trailingColor ?? Colors.white70,
               ),
             if (trailingBadge != null)
               Text(
@@ -944,7 +1408,7 @@ class _AnimatedMetricRow extends StatelessWidget {
                 style: TextStyle(
                   fontSize: 11,
                   fontWeight: FontWeight.w600,
-                  color: trailingColor ?? colorScheme.onSurfaceVariant,
+                  color: trailingColor ?? Colors.white70,
                 ),
               ),
           ],
@@ -954,7 +1418,7 @@ class _AnimatedMetricRow extends StatelessWidget {
           borderRadius: BorderRadius.circular(6),
           child: Container(
             height: 7,
-            color: colorScheme.surfaceContainerHighest.withOpacity(0.7),
+            color: Colors.white.withValues(alpha: 0.12),
             child: TweenAnimationBuilder<double>(
               tween: Tween<double>(end: clamped),
               duration: const Duration(milliseconds: 450),
@@ -982,7 +1446,7 @@ class _AnimatedMetricRow extends StatelessWidget {
   }
 }
 
-/// Bottom-Right Pane: Compact Now Playing + Media Controls + Connection Status.
+/// Bottom-Right Pane: Glassmorphic Now Playing + 60fps Audio Light Bar + Media Controls.
 class _CompactMediaAndStatusCard extends StatelessWidget {
   final DeviceState state;
   final VoidCallback onDisconnect;
@@ -1003,15 +1467,24 @@ class _CompactMediaAndStatusCard extends StatelessWidget {
     final colorScheme = Theme.of(context).colorScheme;
     final isReconnecting =
         state.connectionStatus == BleConnectionStatus.reconnecting;
+    final audioActive = state.isPlaying && !state.isMuted && state.volume > 0;
 
-    return Container(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 350),
       padding: const EdgeInsets.fromLTRB(12, 8, 10, 8),
-      decoration: BoxDecoration(
-        color: colorScheme.surfaceContainerHigh,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(
-          color: colorScheme.outlineVariant.withOpacity(0.35),
-        ),
+      decoration: _glassCardDecoration(
+        borderColor: audioActive
+            ? const Color(0xFF38BDF8).withValues(alpha: 0.42)
+            : Colors.white.withValues(alpha: 0.14),
+        boxShadow: audioActive
+            ? [
+                BoxShadow(
+                  color: const Color(0xFF38BDF8).withValues(alpha: 0.14),
+                  blurRadius: 14,
+                  spreadRadius: 1,
+                ),
+              ]
+            : null,
       ),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -1039,19 +1512,22 @@ class _CompactMediaAndStatusCard extends StatelessWidget {
                   style: TextStyle(
                     fontSize: 11,
                     fontWeight: FontWeight.w600,
-                    color: colorScheme.onSurfaceVariant,
+                    color: Colors.white.withValues(alpha: 0.78),
                   ),
                 ),
               ),
               SizedBox(
-                width: 28,
-                height: 28,
+                width: 26,
+                height: 26,
                 child: IconButton(
                   padding: EdgeInsets.zero,
-                  iconSize: 17,
+                  iconSize: 16,
                   tooltip: 'Disconnect / Scan',
                   onPressed: onDisconnect,
-                  icon: const Icon(Icons.bluetooth_disabled_rounded),
+                  icon: Icon(
+                    Icons.bluetooth_disabled_rounded,
+                    color: Colors.white.withValues(alpha: 0.78),
+                  ),
                 ),
               ),
             ],
@@ -1064,8 +1540,10 @@ class _CompactMediaAndStatusCard extends StatelessWidget {
                 state.isPlaying
                     ? Icons.graphic_eq_rounded
                     : Icons.music_note_rounded,
-                size: 16,
-                color: colorScheme.primary,
+                size: 15,
+                color: audioActive
+                    ? const Color(0xFF22D3EE)
+                    : colorScheme.primary,
               ),
               const SizedBox(width: 6),
               Expanded(
@@ -1080,6 +1558,7 @@ class _CompactMediaAndStatusCard extends StatelessWidget {
                       style: const TextStyle(
                         fontWeight: FontWeight.w600,
                         fontSize: 12,
+                        color: Colors.white,
                       ),
                     ),
                     if (state.mediaArtist.isNotEmpty)
@@ -1089,7 +1568,7 @@ class _CompactMediaAndStatusCard extends StatelessWidget {
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
                           fontSize: 10,
-                          color: colorScheme.onSurfaceVariant,
+                          color: Colors.white.withValues(alpha: 0.65),
                         ),
                       ),
                   ],
@@ -1098,33 +1577,54 @@ class _CompactMediaAndStatusCard extends StatelessWidget {
             ],
           ),
 
+          // Music-Reactive Neon LED Spectrum Visualizer
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 2),
+            child: AudioLightVisualizer(
+              isPlaying: state.isPlaying,
+              volume: state.volume,
+              isMuted: state.isMuted,
+              barCount: 20,
+              height: 30,
+              segmented: true,
+            ),
+          ),
+
           // Media Transport Controls
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
               IconButton.filledTonal(
+                style: IconButton.styleFrom(
+                  backgroundColor: Colors.white.withValues(alpha: 0.12),
+                  foregroundColor: Colors.white,
+                ),
                 visualDensity: VisualDensity.compact,
-                iconSize: 20,
+                iconSize: 19,
                 onPressed: onPrevious,
                 icon: const Icon(Icons.skip_previous_rounded),
               ),
               FilledButton(
                 style: FilledButton.styleFrom(
                   shape: const CircleBorder(),
-                  padding: const EdgeInsets.all(10),
-                  minimumSize: const Size(42, 42),
+                  padding: const EdgeInsets.all(8),
+                  minimumSize: const Size(38, 38),
                 ),
                 onPressed: onPlayPause,
                 child: Icon(
                   state.isPlaying
                       ? Icons.pause_rounded
                       : Icons.play_arrow_rounded,
-                  size: 24,
+                  size: 22,
                 ),
               ),
               IconButton.filledTonal(
+                style: IconButton.styleFrom(
+                  backgroundColor: Colors.white.withValues(alpha: 0.12),
+                  foregroundColor: Colors.white,
+                ),
                 visualDensity: VisualDensity.compact,
-                iconSize: 20,
+                iconSize: 19,
                 onPressed: onNext,
                 icon: const Icon(Icons.skip_next_rounded),
               ),
@@ -1136,7 +1636,7 @@ class _CompactMediaAndStatusCard extends StatelessWidget {
   }
 }
 
-/// Tactile, full-height vertical pill slider designed for landscape Stream-Deck control.
+/// Tactile, glassmorphic vertical pill slider with optional reactive audio light backdrop.
 class _VerticalControlSlider extends StatefulWidget {
   final String label;
   final String badgeText;
@@ -1149,6 +1649,8 @@ class _VerticalControlSlider extends StatefulWidget {
   final ValueChanged<int> onChanged;
   final ValueChanged<int> onChangeEnd;
   final VoidCallback? onIconTap;
+  final bool reactiveGlow;
+  final Widget? backgroundVisualizer;
 
   const _VerticalControlSlider({
     required this.label,
@@ -1162,6 +1664,8 @@ class _VerticalControlSlider extends StatefulWidget {
     required this.onChanged,
     required this.onChangeEnd,
     this.onIconTap,
+    this.reactiveGlow = false,
+    this.backgroundVisualizer,
   });
 
   @override
@@ -1190,12 +1694,11 @@ class _VerticalControlSliderState extends State<_VerticalControlSlider> {
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
     final fraction =
         ((widget.value - widget.min) / (widget.max - widget.min)).clamp(0.0, 1.0);
     final fillColor = widget.isDimmed
-        ? colorScheme.onSurfaceVariant.withOpacity(0.25)
-        : widget.accentColor.withOpacity(0.88);
+        ? Colors.white.withValues(alpha: 0.18)
+        : widget.accentColor.withValues(alpha: 0.80);
 
     return Column(
       children: [
@@ -1205,7 +1708,10 @@ class _VerticalControlSliderState extends State<_VerticalControlSlider> {
             fontSize: 11,
             letterSpacing: 1.2,
             fontWeight: FontWeight.w700,
-            color: colorScheme.onSurfaceVariant,
+            color: Colors.white.withValues(alpha: 0.80),
+            shadows: const [
+              Shadow(blurRadius: 4, color: Colors.black87),
+            ],
           ),
         ),
         const SizedBox(height: 6),
@@ -1228,26 +1734,44 @@ class _VerticalControlSliderState extends State<_VerticalControlSlider> {
                 },
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(22),
-                  child: Container(
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 300),
                     width: double.infinity,
                     decoration: BoxDecoration(
-                      color:
-                          colorScheme.surfaceContainerHighest.withOpacity(0.55),
+                      color: Colors.black.withValues(alpha: 0.42),
                       borderRadius: BorderRadius.circular(22),
                       border: Border.all(
-                        color: colorScheme.outlineVariant.withOpacity(0.35),
-                        width: 1.4,
+                        color: widget.reactiveGlow
+                            ? const Color(0xFF22D3EE).withValues(alpha: 0.48)
+                            : Colors.white.withValues(alpha: 0.16),
+                        width: 1.2,
                       ),
                     ),
                     child: Stack(
                       alignment: Alignment.bottomCenter,
                       children: [
+                        if (widget.backgroundVisualizer != null)
+                          Positioned(
+                            left: 4,
+                            right: 4,
+                            bottom: 4,
+                            child: IgnorePointer(
+                              child: widget.backgroundVisualizer!,
+                            ),
+                          ),
                         FractionallySizedBox(
                           heightFactor: fraction,
                           widthFactor: 1.0,
                           child: Container(
                             decoration: BoxDecoration(
-                              color: fillColor,
+                              gradient: LinearGradient(
+                                begin: Alignment.bottomCenter,
+                                end: Alignment.topCenter,
+                                colors: [
+                                  fillColor.withValues(alpha: 0.72),
+                                  fillColor,
+                                ],
+                              ),
                               borderRadius: const BorderRadius.vertical(
                                 top: Radius.circular(10),
                               ),
@@ -1263,7 +1787,7 @@ class _VerticalControlSliderState extends State<_VerticalControlSlider> {
                               fontWeight: FontWeight.w700,
                               color: fraction > 0.82 && !widget.isDimmed
                                   ? Colors.black87
-                                  : colorScheme.onSurface,
+                                  : Colors.white,
                             ),
                           ),
                         ),
@@ -1279,7 +1803,7 @@ class _VerticalControlSliderState extends State<_VerticalControlSlider> {
                                 size: 24,
                                 color: fraction > 0.14 && !widget.isDimmed
                                     ? Colors.black87
-                                    : colorScheme.onSurface,
+                                    : Colors.white,
                               ),
                             ),
                           ),
